@@ -1,0 +1,684 @@
+# PRD — Build Spec
+
+**Product:** Travel Discovery
+**Version:** 1.0 — Final
+**Date:** 10 Sep 2026
+**Audience:** AI coding agent (Claude Code, Cursor, or equivalent) + human reviewer
+
+---
+
+## 0. How to use this document
+
+**You are building a production web application from this specification.**
+
+Rules of engagement:
+
+1. **Build in milestone order (§13).** Do not start a milestone until the previous one's Definition of Done passes. Do not build ahead.
+2. **Do not add features not specified here.** If something seems missing, check §14 — it is probably deliberately excluded. Ask rather than assume.
+3. **The data model (§4) is a one-way door.** Implement it exactly. Raise schema concerns before writing migrations, not after.
+4. **§15 guardrails are non-negotiable.** They are correctness requirements, not style preferences. A build that violates them is a failed build regardless of whether it runs.
+5. **Every milestone ships with its tests.** No milestone is done without the acceptance criteria passing.
+6. **When this document is ambiguous, stop and ask.** Do not invent product behaviour.
+
+Write TypeScript throughout. Prefer boring, well-documented libraries over clever ones.
+
+---
+
+## 1. Product in one paragraph
+
+A web app that answers "where should I go?" and "what do I do there?" for Indian-passport outbound travellers. Users get a traveller profile, AI-generated country and city pages bound to real place data, filters, a day planner that clusters 3–4 stops per day on a map, and affiliate booking handoffs. Pages render fully without login; login unlocks saving and personalization.
+
+---
+
+## 2. Tech stack — locked
+
+| Layer | Choice | Notes |
+|---|---|---|
+| Framework | Next.js 15+, App Router, TypeScript strict | Server components by default |
+| Styling | Tailwind CSS | No component library beyond shadcn/ui |
+| UI primitives | shadcn/ui | |
+| Database | PostgreSQL (Supabase or Neon) | |
+| ORM | Drizzle | Typed, migration-first |
+| Auth | Supabase Auth or Auth.js | Email + Google OAuth |
+| LLM | Anthropic API, `claude-sonnet-4-6` | Generation and ranking only |
+| Places data | Google Places API (New) | Factual binding |
+| Routing | Google Routes API | Travel-time matrix |
+| Maps | Google Maps JS API or Mapbox GL | Day planner map |
+| Analytics | PostHog | Events per §12 |
+| Hosting | Vercel | |
+| Caching | Postgres + Next.js `revalidate` | No Redis in v1 |
+
+Do not substitute any of these without asking.
+
+---
+
+## 3. Repository structure
+
+```
+/app
+  /(marketing)/page.tsx              # landing
+  /auth/…                            # sign-in, sign-up, callback
+  /onboarding/page.tsx               # 5-question profile
+  /c/[countrySlug]/page.tsx          # country page
+  /c/[countrySlug]/[citySlug]/page.tsx   # city page
+  /plan/[planId]/page.tsx            # day planner
+  /discover/page.tsx                 # Flow A (M5)
+  /profile/page.tsx
+  /api
+    /generate/country/route.ts
+    /generate/city/route.ts
+    /plan/route.ts
+    /discover/route.ts
+    /corrections/route.ts
+/lib
+  /db          schema.ts, queries.ts, migrations/
+  /llm         client.ts, prompts/, validators.ts
+  /places      google-places.ts, routes.ts, resolve.ts
+  /planner     cluster.ts, schedule.ts
+  /analytics   events.ts
+/components
+  /city        …
+  /country     …
+  /planner     …
+  /shared      …
+/types
+```
+
+---
+
+## 4. Data model
+
+Implement as Drizzle schema. DDL shown for clarity.
+
+```sql
+-- ============ CONTENT ============
+
+CREATE TABLE countries (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  slug                  TEXT UNIQUE NOT NULL,
+  name                  TEXT NOT NULL,
+  region                TEXT,
+  known_for_summary     TEXT,              -- GENERATED, <= 60 words
+  visa_status_in        TEXT,              -- BOUND: visa_free|voa|e_visa|embassy
+  visa_cost_inr         INTEGER,           -- BOUND
+  visa_process_notes    TEXT,              -- BOUND
+  currency              TEXT,
+  daily_cost_inr        JSONB,             -- {budget,mid,lux}
+  best_months           SMALLINT[],
+  domestic_transport    TEXT,
+  safety_score          SMALLINT,          -- 1-5
+  suggested_routes      JSONB,             -- [{name, cities[], days}]
+  last_verified         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  generated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE cities (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  country_id            UUID NOT NULL REFERENCES countries(id),
+  slug                  TEXT NOT NULL,
+  name                  TEXT NOT NULL,
+  lat                   DOUBLE PRECISION NOT NULL,   -- BOUND
+  lng                   DOUBLE PRECISION NOT NULL,   -- BOUND
+  identity_line         TEXT,              -- GENERATED, <= 12 words
+  known_for_summary     TEXT,              -- GENERATED, 3 sentences, <= 60 words
+  ideal_days_min        SMALLINT,
+  ideal_days_max        SMALLINT,
+  daily_cost_inr        JSONB,
+  best_months           SMALLINT[],
+  crowd_by_month        SMALLINT[],        -- 12 values, 1-5
+  flight_time_from      JSONB,             -- {DEL,BOM,BLR,MAA,HYD} in minutes
+  direct_flight         BOOLEAN,
+  safety_score          SMALLINT,
+  solo_female_score     SMALLINT,
+  veg_food_score        SMALLINT,
+  getting_around        JSONB,             -- [{mode, verdict}] max 5
+  vibe_tags             TEXT[],
+  last_verified         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  generated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (country_id, slug)
+);
+
+CREATE TABLE areas (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  city_id       UUID NOT NULL REFERENCES cities(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL,
+  character     TEXT,                      -- GENERATED, one line
+  good_for      TEXT[],
+  cost_band     TEXT,                      -- budget|mid|lux
+  centroid_lat  DOUBLE PRECISION,
+  centroid_lng  DOUBLE PRECISION
+);
+
+CREATE TYPE place_type AS ENUM ('activity','restaurant','stay','day_trip');
+
+CREATE TABLE places (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  city_id             UUID NOT NULL REFERENCES cities(id) ON DELETE CASCADE,
+  area_id             UUID REFERENCES areas(id),
+  google_place_id     TEXT UNIQUE,         -- BOUND. NULL => must not render
+  type                place_type NOT NULL,
+  name                TEXT NOT NULL,
+  description         TEXT,                -- GENERATED, <= 15 words
+  lat                 DOUBLE PRECISION NOT NULL,   -- BOUND
+  lng                 DOUBLE PRECISION NOT NULL,   -- BOUND
+  address             TEXT,                -- BOUND
+  opening_hours       JSONB,               -- BOUND
+  closed_days         SMALLINT[],          -- BOUND
+  cost_band_inr       TEXT,
+  price_inr           INTEGER,             -- BOUND where available
+  avg_duration_mins   SMALLINT,
+  physical_intensity  SMALLINT,            -- 1-5
+  best_time_of_day    TEXT,                -- morning|midday|afternoon|evening|any
+  seasonality         SMALLINT[],
+  suits_solo          BOOLEAN DEFAULT true,
+  suits_couples       BOOLEAN DEFAULT true,
+  suits_friends       BOOLEAN DEFAULT true,
+  suits_family        BOOLEAN DEFAULT true,
+  suits_parents       BOOLEAN DEFAULT true,
+  veg_friendly        BOOLEAN,
+  indoor_outdoor      TEXT,
+  vibe_tags           TEXT[],
+  is_signature        BOOLEAN DEFAULT false,   -- "the big five"
+  booking_url         TEXT,                -- BOUND
+  affiliate_partner   TEXT,
+  -- day_trip only
+  travel_time_mins    SMALLINT,
+  transport_mode      TEXT,
+  overnight_recommended BOOLEAN,
+  confidence_score    SMALLINT,
+  last_verified       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TYPE tip_type AS ENUM
+  ('transport','payment','connectivity','etiquette','safety','timing','booking');
+
+CREATE TABLE tips (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  scope       TEXT NOT NULL,               -- 'country' | 'city'
+  scope_id    UUID NOT NULL,
+  type        tip_type NOT NULL,
+  title       TEXT NOT NULL,               -- <= 10 words
+  body        TEXT NOT NULL,               -- one line, <= 25 words
+  priority    SMALLINT DEFAULT 3,
+  last_verified TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE dishes (
+  id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  city_id   UUID NOT NULL REFERENCES cities(id) ON DELETE CASCADE,
+  name      TEXT NOT NULL,
+  note      TEXT,                          -- <= 12 words
+  veg       BOOLEAN
+);
+
+-- ============ USERS ============
+
+CREATE TABLE user_profiles (
+  id                 UUID PRIMARY KEY,     -- = auth user id
+  home_airport       TEXT,                 -- DEL|BOM|BLR|MAA|HYD
+  passport           TEXT DEFAULT 'IN',
+  travel_style       TEXT[],               -- hostel|hotel|luxury|homestay
+  pace               TEXT,                 -- relaxed|balanced|packed
+  interests          TEXT[],
+  budget_band        TEXT,
+  dietary            TEXT[],
+  mobility           TEXT,
+  been_to            TEXT[],               -- city slugs
+  onboarding_done    BOOLEAN DEFAULT false,
+  created_at         TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE trip_contexts (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID REFERENCES user_profiles(id),
+  month         SMALLINT,
+  start_date    DATE,
+  duration_days SMALLINT,
+  budget_inr    INTEGER,
+  companions    TEXT,                      -- solo|partner|friends|family|parents
+  max_flight_hours SMALLINT,
+  vibe_override TEXT[],
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE saves (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES user_profiles(id),
+  entity_type TEXT NOT NULL,               -- city|place
+  entity_id   UUID NOT NULL,
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (user_id, entity_type, entity_id)
+);
+
+CREATE TABLE plans (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID REFERENCES user_profiles(id),
+  city_id         UUID NOT NULL REFERENCES cities(id),
+  trip_context_id UUID REFERENCES trip_contexts(id),
+  days            JSONB NOT NULL,          -- see §10
+  share_token     TEXT UNIQUE,
+  created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE corrections (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID REFERENCES user_profiles(id),
+  entity_type TEXT NOT NULL,
+  entity_id   UUID NOT NULL,
+  field       TEXT,
+  note        TEXT NOT NULL,
+  evidence_url TEXT,
+  status      TEXT DEFAULT 'pending',      -- pending|approved|rejected
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============ INFRASTRUCTURE ============
+
+CREATE TABLE travel_times (
+  from_place_id UUID NOT NULL,
+  to_place_id   UUID NOT NULL,
+  mode          TEXT NOT NULL,
+  duration_mins SMALLINT NOT NULL,
+  fetched_at    TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (from_place_id, to_place_id, mode)
+);
+
+CREATE TABLE generation_log (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_type   TEXT,
+  entity_id     UUID,
+  model         TEXT,
+  tokens_in     INTEGER,
+  tokens_out    INTEGER,
+  dropped_count INTEGER,                   -- places dropped, unresolvable
+  duration_ms   INTEGER,
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX ON cities (country_id);
+CREATE INDEX ON places (city_id, type);
+CREATE INDEX ON places (city_id, is_signature);
+CREATE INDEX ON tips (scope, scope_id);
+```
+
+---
+
+## 5. Environment variables
+
+```
+DATABASE_URL
+ANTHROPIC_API_KEY
+GOOGLE_MAPS_API_KEY          # Places (New) + Routes enabled
+NEXT_PUBLIC_MAPS_API_KEY     # browser-restricted key, maps only
+NEXT_PUBLIC_POSTHOG_KEY
+POSTHOG_HOST
+AUTH_SECRET
+GOOGLE_OAUTH_CLIENT_ID
+GOOGLE_OAUTH_CLIENT_SECRET
+AFFILIATE_GYG_ID
+AFFILIATE_BOOKING_ID
+AFFILIATE_AIRALO_ID
+AFFILIATE_INSURANCE_ID
+```
+
+---
+
+## 6. Generation pipeline
+
+### 6.1 Flow
+
+```
+request city page
+  → cache hit AND generated_at < 30 days ? serve
+  → else generate:
+      1. LLM call → JSON matching the city schema
+      2. Zod validation → reject and retry once on failure
+      3. For every place: resolve against Google Places API by name + city
+           - resolved   → write BOUND fields from API response
+           - unresolved → DROP the place, increment dropped_count
+      4. Enforce caps (§7)
+      5. Persist all rows
+      6. Log to generation_log
+  → serve
+```
+
+Pre-warm the top 50 cities (§6.4) via a seed script before launch.
+
+### 6.2 LLM output contract
+
+The model returns **JSON only**, no prose, no markdown fences. Validate with Zod. Structure:
+
+```ts
+{
+  identity_line: string,          // <= 12 words
+  known_for_summary: string,      // 3 sentences, <= 60 words
+  ideal_days_min: number, ideal_days_max: number,
+  daily_cost_inr: { budget: number, mid: number, lux: number },
+  best_months: number[], crowd_by_month: number[],  // 12
+  safety_score: number, solo_female_score: number, veg_food_score: number,
+  getting_around: { mode: string, verdict: string }[],   // max 5
+  vibe_tags: string[],
+  areas: { name, character, good_for: string[], cost_band }[],       // 3-5
+  signature_places: { name, hook }[],                                 // exactly 5
+  activities: { name, description, cost_band_inr, avg_duration_mins,
+                physical_intensity, best_time_of_day, indoor_outdoor,
+                suits_*: boolean, area_name }[],                      // 12-20
+  dishes: { name, note, veg }[],                                      // 3
+  restaurants: { name, description, cost_band_inr, veg_friendly, area_name }[], // 8
+  day_trips: { name, description, travel_time_mins, transport_mode,
+               cost_band_inr, overnight_recommended }[],              // 3-4
+  stays: { name, cost_band_inr, area_name }[],                        // 6
+  tips: { type, title, body, priority }[]                             // 5-8
+}
+```
+
+### 6.3 Prompt template — city generation
+
+```
+You are a travel data generator. Return ONLY valid JSON matching the
+provided schema. No prose, no markdown fences, no commentary.
+
+CITY: {city_name}, {country_name}
+AUDIENCE: Indian passport holders travelling outbound, budgets in INR,
+  solo and small-group leisure skew.
+
+HARD RULES
+- Never invent opening hours, addresses, phone numbers, exact prices,
+  coordinates, or booking URLs. Omit those fields entirely; they are
+  populated from an external API downstream.
+- Place names must be real, currently operating, and specific enough to
+  be found on a map. If unsure a place still exists, omit it.
+- known_for_summary: exactly 3 sentences, max 60 words, honest about the
+  place's actual character. No brochure language, no "hidden gem",
+  no "nestled", no "vibrant tapestry".
+- description fields: max 15 words, concrete and specific. Say what it
+  actually is and why someone would go, not how it feels.
+- tips: specific and actionable. "Get a Suica card at the airport, almost
+  everything runs on it" is correct. "Respect local customs" is useless —
+  never produce tips of that kind.
+- signature_places: exactly 5, the genuinely unmissable ones.
+- Cost bands in INR, realistic for 2026.
+- area_name on each place must match one of the areas you returned.
+
+SCHEMA
+{json_schema}
+```
+
+### 6.4 Pre-warm list
+
+Bangkok · Bali (Denpasar) · Dubai · Singapore · Hanoi · Da Nang · Ho Chi Minh City · Hoi An · Phuket · Chiang Mai · Tbilisi · Baku · Kathmandu · Pokhara · Colombo · Kandy · Tokyo · Kyoto · Osaka · Kuala Lumpur · Langkawi · Istanbul · Cappadocia · Abu Dhabi · Male · Almaty · Tashkent · Samarkand · Yerevan · Seoul · Hong Kong · Bangkok day-trip hubs · Krabi · Ubud · Gili · Siem Reap · Phnom Penh · Vientiane · Luang Prabang · Manila · Cebu · Bohol · Taipei · Doha · Muscat · Cairo · Amman · Zanzibar · Nairobi · Mauritius
+
+Countries: Thailand, Indonesia, UAE, Singapore, Vietnam, Georgia, Azerbaijan, Nepal, Sri Lanka, Japan, Malaysia, Turkey.
+
+---
+
+## 7. Page specifications
+
+### 7.1 Country page — `/c/[countrySlug]`
+
+| Section | Cap |
+|---|---|
+| Name + known-for | 3–4 sentences |
+| Cities grid | Cards → city pages, with "best for" tags + suggested days |
+| Suggested routes | 2–4 |
+| Practicalities | Visa (IN passport), currency, ₹/day, best months, transport, safety |
+| When to go | 12-month strip |
+
+Do not duplicate city content. Country pages are an index.
+
+**Acceptance:** renders logged-out; all city cards link correctly; visa data present; LCP < 2.5s.
+
+### 7.2 City page — `/c/[countrySlug]/[citySlug]`
+
+**Above the fold**
+
+| Element | Budget |
+|---|---|
+| Name + identity line | ≤ 12 words |
+| Known for | 3 sentences, ≤ 60 words |
+| Quick facts strip | 5 chips: ideal days · ₹/day · best months · safety · getting in |
+| The big five | 5 cards: image, name, 8-word hook |
+| Primary CTA | `Plan my days` |
+| Secondary CTA | `Save city` |
+
+**Below the fold — collapsed accordions**
+
+| # | Section | Cap | Item budget |
+|---|---|---|---|
+| 1 | Areas | 3–5 | Name + one line + tags |
+| 2 | Things to do | 10 shown, paginated, filterable | Name + 15 words + cost + duration + `Book` |
+| 3 | Eat | 3 dishes + 8 places | Name + 12 words + price band + veg flag |
+| 4 | Day trips | 3–4 | Name + 15 words + travel time + cost + overnight? |
+| 5 | Getting around | 4–5 lines | Verdict-first, one line per mode |
+| 6 | Know before you go | 5–8 tips | One line each, `tip_type` tagged |
+| 7 | Where to stay | 3 bands × 2 | Area + property + price + `Book` |
+| 8 | Traveller notes | 5 recent | Timestamped, attributed |
+
+**Rules**
+- No section renders as a paragraph block. Cards, chips, single lines only.
+- Filters (§7.3) apply to sections 2, 3, 4, 7.
+- `last_verified` visible on the page.
+- Three render states: logged-out (canonical, indexable) · logged-in (re-ordered to interests) · trip context active (additionally filtered). **Personalization changes order and emphasis, never availability.**
+
+**Acceptance:** full render logged-out · skimmable in 60s on a 390px viewport · every cap enforced · no place renders without a `google_place_id` · `Book` links carry affiliate params · SSR + `generateMetadata` for SEO.
+
+### 7.3 Filters
+
+`budget band · who you're with · interests · physical intensity · time available · indoor/outdoor · veg-friendly · bookable now`
+
+Defaults derive from trip context; always manually overridable; state in URL params.
+
+### 7.4 Onboarding — `/onboarding`
+
+Five questions, one per screen, each skippable:
+1. Home airport
+2. Travel style (multi-select)
+3. Interests (multi-select, max 5)
+4. Typical budget band
+5. Dietary
+
+**Acceptance:** completable in under 45 seconds; skipping all five still creates a valid profile.
+
+---
+
+## 8. API contracts
+
+```
+POST /api/generate/city
+  body   { citySlug, countrySlug, force?: boolean }
+  200    { cityId, cached: boolean, droppedCount: number }
+
+POST /api/plan
+  body   { cityId, days: number, pace: 'relaxed'|'balanced'|'packed',
+           tripContextId?: string, savedPlaceIds?: string[] }
+  200    { planId, days: Day[] }        // Day shape in §10
+
+PATCH /api/plan/:id
+  body   { dayIndex, action: 'swap'|'remove'|'add', placeId? }
+  200    { days: Day[] }
+
+POST /api/discover                        # M5
+  body   { month, durationDays, budgetInr, companions, maxFlightHours? }
+  200    { results: { cityId, name, country, whyItFits, estCostInr,
+                      flightTimeMins, direct, visaStatus, weather,
+                      crowdLevel }[] }    // 5-8
+
+POST /api/corrections
+  body   { entityType, entityId, field?, note, evidenceUrl? }
+  201    { id }
+```
+
+All routes: Zod-validated input, typed responses, structured errors `{ error: { code, message } }`.
+
+---
+
+## 9. Discovery flow (M5)
+
+```
+natural-language or form input
+  → LLM extracts structured trip_context
+  → DETERMINISTIC SQL filter over cities
+       (budget, flight time, visa, month suitability, safety)
+  → LLM re-ranks the filtered set against user_profile + trip_context
+  → LLM writes "why this fits" FROM MATCHED ATTRIBUTE VALUES ONLY
+  → return 5-8
+```
+
+Requirements: results in < 5s (stream if needed) · every card carries a traceable reason string · include one flagged "you probably haven't considered this" pick · if constraints are unsatisfiable, name the binding constraint rather than returning nothing.
+
+---
+
+## 10. Day planner
+
+### 10.1 Algorithm
+
+```
+1. candidates = places in city, filtered by profile + trip context
+2. cluster candidates by area_id (fall back to k-means on lat/lng)
+3. rank clusters by count and quality of signature places
+4. assign ONE cluster per day — never split a day across the city
+5. within each day:
+     - select 3-4 anchors max
+     - order by best_time_of_day, then opening_hours feasibility
+     - insert exactly one restaurant anchor from the same cluster
+6. fetch travel times between consecutive anchors (cache in travel_times)
+7. validate: total travel time <= pace threshold
+     relaxed 45min | balanced 75min | packed 110min
+8. if exceeded: drop the furthest anchor, re-run from step 5
+```
+
+**Hard rule: never more than 4 anchors per day.** A day with six stops is a spreadsheet, not a plan.
+
+### 10.2 Day shape
+
+```ts
+type Day = {
+  dayIndex: number
+  areaName: string
+  anchors: {
+    placeId: string
+    name: string
+    slot: 'morning'|'midday'|'afternoon'|'evening'
+    why: string              // <= 12 words
+    durationMins: number
+    costBand: string
+    bookingUrl?: string
+    lat: number; lng: number
+    travelToNext?: { mins: number; mode: string }
+  }[]
+  totalTravelMins: number
+}
+```
+
+### 10.3 UI
+
+One card per day. Map shows only that day's anchors, numbered, route drawn between them. Total travel time stated plainly. Per-anchor actions: swap · remove · add from saved. Per-day action: regenerate.
+
+**Acceptance:** a 3-day Bangkok plan produces three distinct area clusters with no cross-city zigzag · every anchor is open at its assigned slot · map renders all anchors with a route · total travel time within the pace threshold.
+
+---
+
+## 11. Auth and access
+
+| Action | Login required |
+|---|---|
+| View country page | No |
+| View city page (full) | **No** |
+| Use filters | No |
+| Save a city or place | Yes |
+| Create a plan | Yes |
+| Submit a correction | Yes |
+| Personalized ordering | Yes |
+
+**Never gate content behind login.** Prompt at the point of save, plan, or personalize — never on page load, never as an interstitial.
+
+---
+
+## 12. Analytics events
+
+```
+session_start · signup_started · signup_completed
+onboarding_step_completed(step) · onboarding_skipped
+country_page_viewed(slug) · city_page_viewed(slug, state)
+section_expanded(section) · filter_applied(filter, value)
+signature_card_clicked · city_saved · place_saved
+plan_requested(days, pace) · plan_created(days) · plan_edited(action)
+affiliate_click(category, partner, placeId)
+correction_submitted · usefulness_vote(value)
+discover_submitted(constraints) · discover_result_clicked
+return_session(days_since_last)
+```
+
+Every §9 BRD metric must be computable from these. Instrument in M1, before any feature depends on it.
+
+---
+
+## 13. Milestones
+
+### M1 — Sign-up and identity · weeks 1–3
+Auth (email + Google) · onboarding (§7.4) · profile CRUD · saves scaffolding · analytics live · full schema migrated.
+**DoD:** user signs up, completes or skips onboarding, profile persists across sessions; all §12 events firing.
+
+### M2 — Country page · weeks 3–5
+Generation pipeline end-to-end · two-tier trust enforcement · country template · 12 countries pre-warmed.
+**DoD:** any of 12 countries renders correct, capped, cached in < 2s; a new country generates with zero schema violations.
+
+*Country before city is deliberate: same pipeline, quarter the sections, proves generation and caching on low-risk content first.*
+
+### M3 — City page · weeks 5–9
+Full outline · Places resolution with drop-logging · filters · tips · booking handoff · three render states · 50 cities pre-warmed · top-20 quality review.
+**DoD:** top 20 cities pass the review rubric; a cold city generates in < 10s; page skimmable in 60s at 390px; zero unresolved places rendered.
+
+### M4 — Day planner and monetization · weeks 9–12
+Planner algorithm · map · travel-time caching · affiliate live across 4 categories · conversion instrumentation.
+**DoD:** §10.3 acceptance passes; affiliate clicks attributed per category.
+
+### M5 — Discovery flow · weeks 12–15
+Per §9. **This is the cut if the timeline compresses.**
+**DoD:** results in < 5s with traceable reasons; unsatisfiable constraints handled gracefully.
+
+### M6 — Beta · weeks 15–16
+Closed beta with 50 users, then open. Measure against BRD §9.
+
+---
+
+## 14. Do not build
+
+Booking engine · payments · traveller matching · user-to-user messaging · group chat · creator storefronts · native apps · multi-language · India-domestic · multi-city routing · real-time in-trip replanning · calendar sync · subscription/paywall · long-form travel-blog prose · history and culture essays · AI chat interface as the primary surface · Redis · microservices · custom design system.
+
+If a request arrives for any of these, it goes to a backlog file, not into the build.
+
+---
+
+## 15. Guardrails — non-negotiable
+
+1. **The LLM never emits a factual field.** Coordinates, opening hours, addresses, prices, booking URLs, visa rules, ratings come from Google Places or partner APIs. The model writes descriptions and rationales only. A build where the model supplies these is a failed build.
+2. **Unresolvable places are dropped, not rendered.** No `google_place_id`, no render. Increment `dropped_count` and log it.
+3. **Content caps are enforced in code**, not left to the prompt. Truncate or reject overflow at validation.
+4. **Commercial links never affect ranking order.** Sort by fit. An item with no affiliate link still ranks first if it fits best.
+5. **Pages render fully logged-out.** No content gating, ever.
+6. **`last_verified` is always visible** on any page displaying factual data.
+7. **Never more than 4 anchors per planner day.**
+8. **Personalization re-orders; it never removes.** Users must always be able to see everything.
+9. **Cache aggressively.** Google Places and Routes are the variable cost driver. Never call either on a cache hit.
+10. **No secrets client-side.** Only `NEXT_PUBLIC_MAPS_API_KEY`, browser-restricted, maps-only.
+
+---
+
+## 16. Test requirements
+
+- **Unit:** Zod validators, clustering, scheduling, cap enforcement, travel-time thresholds
+- **Integration:** generation pipeline end-to-end with a mocked Places API, including the drop path
+- **E2E (Playwright):** sign-up → onboarding → city page → filter → plan → affiliate click
+- **Regression:** for each of 5 fixture cities, assert every cap and that no place lacks a `google_place_id`
+- **Performance:** cached city page LCP < 2.5s; cold generation < 10s
+
+---
+
+## 17. Open items for the human
+
+1. Confirm India-outbound wedge — drives pre-warm list and filter defaults
+2. Affiliate network approvals (Awin / Travelpayouts / Impact) — start week 1, they take weeks
+3. Monthly ceiling for Places, Routes and inference spend
+4. Visa data source: manual, scraped, or licensed
+5. Who runs the top-20 quality review in M3

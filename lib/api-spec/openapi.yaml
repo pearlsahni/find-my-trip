@@ -1,0 +1,424 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: countries
+    description: Country discovery pages
+  - name: cities
+    description: City discovery pages
+  - name: account
+    description: Signed-in traveler preferences
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /countries:
+    get:
+      operationId: listCountries
+      tags: [countries]
+      summary: List countries available for discovery
+      responses:
+        "200":
+          description: Searchable country directory
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CountryResponse"
+  /countries/{countrySlug}:
+    get:
+      operationId: getCountry
+      tags: [countries]
+      summary: Get a country index page
+      parameters:
+        - name: countrySlug
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+      responses:
+        "200":
+          description: Country index data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CountryResponse"
+        "404":
+          description: Country not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /generate/country:
+    post:
+      operationId: generateCountry
+      tags: [countries]
+      summary: Generate or refresh a country index
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateCountryRequest"
+      responses:
+        "200":
+          description: Generated country index
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CountryResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: Country not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /cities/{countrySlug}/{citySlug}:
+    get:
+      operationId: getCity
+      tags: [cities]
+      summary: Get a city discovery page
+      parameters:
+        - { name: countrySlug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" } }
+        - { name: citySlug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" } }
+      responses:
+        "200":
+          description: Capped verified city content
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CityResponse" }
+        "400":
+          description: Invalid slug
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404":
+          description: City not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+  /generate/city:
+    post:
+      operationId: generateCity
+      tags: [cities]
+      summary: Generate or refresh a city page
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CityGenerationInput" }
+      responses:
+        "200":
+          description: Generation result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CityGenerationResult" }
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404":
+          description: City not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+  /me/preferences:
+    get:
+      operationId: getTravelerProfile
+      tags: [account]
+      summary: Get saved preferences for the current traveler
+      responses:
+        "200":
+          description: Saved profile or signed-out fallback
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TravelerProfile" }
+    put:
+      operationId: updateTravelerPreferences
+      tags: [account]
+      summary: Save preferences for the current traveler
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TravelerPreferences" }
+      responses:
+        "200":
+          description: Saved profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TravelerProfile" }
+        "401":
+          description: Sign-in required
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    TravelerPreferences:
+      type: object
+      properties:
+        vibes: { type: array, maxItems: 6, items: { type: string, maxLength: 30 } }
+        companions: { type: string, maxLength: 30 }
+        interests: { type: array, maxItems: 5, items: { type: string, maxLength: 30 } }
+        budget: { type: string, maxLength: 30 }
+        diet: { type: array, maxItems: 3, items: { type: string, maxLength: 30 } }
+        skipped:
+          type: object
+          additionalProperties: { type: boolean }
+      required: [vibes, companions, interests, budget, diet, skipped]
+    TravelerProfile:
+      type: object
+      properties:
+        user_id: { type: ["string", "null"] }
+        preferences:
+          anyOf:
+            - { $ref: "#/components/schemas/TravelerPreferences" }
+            - { type: "null" }
+      required: [user_id, preferences]
+    DailyCost:
+      type: object
+      properties:
+        budget: { type: integer, minimum: 0 }
+        mid: { type: integer, minimum: 0 }
+        lux: { type: integer, minimum: 0 }
+      required: [budget, mid, lux]
+    CountryCityCard:
+      type: object
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        identity_line: { type: string, maxLength: 100 }
+        best_for:
+          type: array
+          maxItems: 5
+          items: { type: string, maxLength: 30 }
+        suggested_days_min: { type: integer, minimum: 1, maximum: 30 }
+        suggested_days_max: { type: integer, minimum: 1, maximum: 30 }
+      required: [slug, name, identity_line, best_for, suggested_days_min, suggested_days_max]
+    SuggestedRoute:
+      type: object
+      properties:
+        name: { type: string, maxLength: 80 }
+        cities:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { type: string }
+        days: { type: integer, minimum: 1, maximum: 30 }
+      required: [name, cities, days]
+    CountryDish:
+      type: object
+      properties:
+        name: { type: string, maxLength: 80 }
+        note: { type: string, maxLength: 140 }
+        where: { type: string, maxLength: 80 }
+      required: [name, note]
+    CountryResponse:
+      type: object
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        region: { type: string }
+        known_for_summary: { type: string, maxLength: 420 }
+        visa_status_in:
+          type: string
+          enum: [visa_free, voa, e_visa, embassy]
+        visa_cost_inr: { type: integer, minimum: 0 }
+        visa_process_notes: { type: string, maxLength: 300 }
+        currency: { type: string }
+        daily_cost_inr: { $ref: "#/components/schemas/DailyCost" }
+        best_months:
+          type: array
+          minItems: 1
+          maxItems: 12
+          items: { type: integer, minimum: 1, maximum: 12 }
+        domestic_transport: { type: string, maxLength: 240 }
+        safety_score: { type: integer, minimum: 1, maximum: 5 }
+        suggested_routes:
+          type: array
+          minItems: 2
+          maxItems: 4
+          items: { $ref: "#/components/schemas/SuggestedRoute" }
+        cities:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { $ref: "#/components/schemas/CountryCityCard" }
+        top_dishes:
+          type: array
+          minItems: 4
+          maxItems: 6
+          items: { $ref: "#/components/schemas/CountryDish" }
+        monthly:
+          type: array
+          minItems: 12
+          maxItems: 12
+          items:
+            type: object
+            properties:
+              month: { type: integer, minimum: 1, maximum: 12 }
+              label: { type: string }
+              score: { type: integer, minimum: 1, maximum: 5 }
+            required: [month, label, score]
+        last_verified: { type: string, format: date-time }
+        generated_at: { type: string, format: date-time }
+      required: [slug, name, region, known_for_summary, visa_status_in, visa_cost_inr, visa_process_notes, currency, daily_cost_inr, best_months, domestic_transport, safety_score, suggested_routes, cities, top_dishes, monthly, last_verified, generated_at]
+    GenerateCountryRequest:
+      type: object
+      properties:
+        countrySlug:
+          type: string
+          pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        force: { type: boolean, default: false }
+      required: [countrySlug]
+    CityArea:
+      type: object
+      required: [name, character, good_for, cost_band]
+      properties:
+        name: { type: string, maxLength: 60 }
+        character: { type: string, maxLength: 160 }
+        good_for: { type: array, maxItems: 5, items: { type: string } }
+        cost_band: { type: string, enum: [budget, mid, lux] }
+    CityPlace:
+      type: object
+      required: [id, google_place_id, type, name, description, address, cost_band_inr, avg_duration_mins, physical_intensity, best_time_of_day, suits, veg_friendly, indoor_outdoor, vibe_tags, is_signature, bookable, last_verified]
+      properties:
+        id: { type: string }
+        google_place_id: { type: string, minLength: 1 }
+        type: { type: string, enum: [activity, restaurant, stay, day_trip] }
+        name: { type: string }
+        description: { type: string, maxLength: 120 }
+        address: { type: string }
+        cost_band_inr: { type: string, enum: [budget, mid, lux] }
+        price_inr: { type: ["integer", "null"], minimum: 0 }
+        avg_duration_mins: { type: integer, minimum: 15 }
+        physical_intensity: { type: integer, minimum: 1, maximum: 5 }
+        best_time_of_day: { type: string }
+        suits: { type: array, items: { type: string, enum: [solo, partner, friends, family, parents] } }
+        veg_friendly: { type: boolean }
+        indoor_outdoor: { type: string, enum: [indoor, outdoor, both] }
+        vibe_tags: { type: array, items: { type: string } }
+        is_signature: { type: boolean }
+        booking_url: { type: ["string", "null"] }
+        affiliate_partner: { type: ["string", "null"] }
+        bookable: { type: boolean }
+        travel_time_mins: { type: ["integer", "null"] }
+        transport_mode: { type: ["string", "null"] }
+        overnight_recommended: { type: ["boolean", "null"] }
+        last_verified: { type: string, format: date-time }
+    CityDish:
+      type: object
+      required: [name, note, veg]
+      properties:
+        name: { type: string }
+        note: { type: string, maxLength: 90 }
+        veg: { type: boolean }
+    CityTip:
+      type: object
+      required: [type, title, body]
+      properties:
+        type: { type: string, enum: [transport, payment, connectivity, etiquette, safety, timing, booking] }
+        title: { type: string, maxLength: 70 }
+        body: { type: string, maxLength: 180 }
+    TravellerNote:
+      type: object
+      required: [attribution, body, created_at]
+      properties:
+        attribution: { type: string }
+        body: { type: string, maxLength: 240 }
+        created_at: { type: string, format: date-time }
+    GettingAroundItem:
+      type: object
+      required: [mode, verdict]
+      properties:
+        mode: { type: string }
+        verdict: { type: string, maxLength: 160 }
+    CityResponse:
+      type: object
+      required: [country_slug, country_name, slug, name, identity_line, known_for_summary, ideal_days_min, ideal_days_max, daily_cost_inr, best_months, safety_score, getting_in, getting_around, areas, signature_places, activities, dishes, restaurants, day_trips, tips, stays, traveller_notes, last_verified, generated_at, cached, dropped_count]
+      properties:
+        country_slug: { type: string }
+        country_name: { type: string }
+        slug: { type: string }
+        name: { type: string }
+        identity_line: { type: string, maxLength: 100 }
+        known_for_summary: { type: string, maxLength: 420 }
+        ideal_days_min: { type: integer, minimum: 1 }
+        ideal_days_max: { type: integer, minimum: 1 }
+        daily_cost_inr: { $ref: "#/components/schemas/DailyCost" }
+        best_months: { type: array, maxItems: 12, items: { type: integer, minimum: 1, maximum: 12 } }
+        safety_score: { type: integer, minimum: 1, maximum: 5 }
+        getting_in: { type: string }
+        getting_around: { type: array, minItems: 4, maxItems: 5, items: { $ref: "#/components/schemas/GettingAroundItem" } }
+        areas: { type: array, minItems: 3, maxItems: 5, items: { $ref: "#/components/schemas/CityArea" } }
+        signature_places: { type: array, minItems: 5, maxItems: 5, items: { $ref: "#/components/schemas/CityPlace" } }
+        activities: { type: array, maxItems: 20, items: { $ref: "#/components/schemas/CityPlace" } }
+        dishes: { type: array, maxItems: 3, items: { $ref: "#/components/schemas/CityDish" } }
+        restaurants: { type: array, maxItems: 8, items: { $ref: "#/components/schemas/CityPlace" } }
+        day_trips: { type: array, maxItems: 4, items: { $ref: "#/components/schemas/CityPlace" } }
+        tips: { type: array, maxItems: 8, items: { $ref: "#/components/schemas/CityTip" } }
+        stays: { type: array, maxItems: 6, items: { $ref: "#/components/schemas/CityPlace" } }
+        traveller_notes: { type: array, maxItems: 5, items: { $ref: "#/components/schemas/TravellerNote" } }
+        last_verified: { type: string, format: date-time }
+        generated_at: { type: string, format: date-time }
+        cached: { type: boolean }
+        dropped_count: { type: integer, minimum: 0 }
+    CityGenerationInput:
+      type: object
+      required: [citySlug, countrySlug]
+      properties:
+        citySlug: { type: string, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" }
+        countrySlug: { type: string, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$" }
+        force: { type: boolean, default: false }
+    CityGenerationResult:
+      type: object
+      required: [cityId, cached, droppedCount]
+      properties:
+        cityId: { type: string }
+        cached: { type: boolean }
+        droppedCount: { type: integer, minimum: 0 }
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+          required: [code, message]
+      required: [error]

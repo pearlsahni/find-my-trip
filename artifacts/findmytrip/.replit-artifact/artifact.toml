@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "FindMyTrip"
+description = "A travel discovery app for Indian passport holders that helps people choose destinations, understand what to do there, and plan their days with practical, personalized guidance."
+version = "1.0.0"
+id = "artifacts/findmytrip"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18530
+
+[services.development]
+run = "pnpm --filter @workspace/findmytrip run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/findmytrip", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/findmytrip/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "18530"
+BASE_PATH = "/"

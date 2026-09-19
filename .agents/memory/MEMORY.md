@@ -1,0 +1,3 @@
+- [Travel image sourcing](travel-image-sourcing.md) — use curated stable photo URLs for destination identity; tagged random-image endpoints can return wrong landmarks or 404s.
+- [Regional destination labels](regional-destination-labels.md) — keep established slugs but explicitly distinguish islands/regions from their traveller bases.
+- [Traveler preference isolation](traveler-preference-isolation.md) — server profiles win after sign-in; anonymous drafts transfer once and authenticated device caches stay user-scoped.
